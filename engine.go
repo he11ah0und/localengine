@@ -14,6 +14,8 @@ import (
 	"path"
 	"slices"
 	"strings"
+
+	"github.com/he11ah0und/yamltree"
 )
 
 // Logger is the minimal logging surface used by the engine.
@@ -90,7 +92,7 @@ func LoadFromOSDir(dir string) error {
 }
 
 func loadLanguage(lang string, data []byte) error {
-	raw, err := loadTree(data)
+	raw, err := yamltree.LoadTree(data)
 	if err != nil {
 		return err
 	}
