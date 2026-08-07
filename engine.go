@@ -15,46 +15,33 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/he11ah0und/logger"
 	"github.com/he11ah0und/yamltree"
 )
-
-// Logger is the minimal logging surface used by the engine.
-// It is satisfied by any type with formatted Debug/Info/Warn methods.
-type Logger interface {
-	Debugf(format string, args ...any)
-	Infof(format string, args ...any)
-	Warnf(format string, args ...any)
-}
 
 var (
 	bundles     = make(map[string]map[string]any)
 	currentLang = "en"
-	log         Logger
+	log         *logger.LogTerminal
 )
 
-// SetLogger sets the logger used by the engine. It is optional: when unset,
-// all log output is discarded. It should be called once during application
-// initialization.
-func SetLogger(l Logger) {
+// SetLogger sets the logger terminal used by the engine. It is optional:
+// logging through a nil terminal is a no-op. It should be called once during
+// application initialization.
+func SetLogger(l *logger.LogTerminal) {
 	log = l
 }
 
 func debugf(format string, args ...any) {
-	if log != nil {
-		log.Debugf(format, args...)
-	}
+	log.Debugf(append([]any{format}, args...)...)
 }
 
 func infof(format string, args ...any) {
-	if log != nil {
-		log.Infof(format, args...)
-	}
+	log.Infof(append([]any{format}, args...)...)
 }
 
 func warnf(format string, args ...any) {
-	if log != nil {
-		log.Warnf(format, args...)
-	}
+	log.Warnf(append([]any{format}, args...)...)
 }
 
 // LoadFromDir reads all *.yaml files from the root of fsys and parses them
