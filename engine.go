@@ -26,6 +26,30 @@ var (
 	log         *logger.LogTerminal
 )
 
+// staticSuffix marks static bundles: any file named *.static.yaml holds names
+// that are never translated (brand names, technical terms). Static bundles
+// load like regular locale files and take part in validation, but they are
+// not selectable UI languages. There may be several static bundles in one
+// project (e.g. app.static.yaml, terms.static.yaml).
+const staticSuffix = ".static"
+
+// isStaticBundle reports whether the bundle name refers to a static bundle.
+func isStaticBundle(name string) bool {
+	return strings.HasSuffix(name, staticSuffix)
+}
+
+// staticBundleNames returns the sorted names of all loaded static bundles.
+func staticBundleNames() []string {
+	names := make([]string, 0, len(bundles))
+	for name := range bundles {
+		if isStaticBundle(name) {
+			names = append(names, name)
+		}
+	}
+	slices.Sort(names)
+	return names
+}
+
 // SetLogger sets the logger terminal used by the engine. It is optional:
 // logging through a nil terminal is a no-op. It should be called once during
 // application initialization.
@@ -48,6 +72,10 @@ func warnf(format string, args ...any) {
 // LoadFromDir reads all *.yaml files from the root of fsys and parses them
 // as locales. fsys may be an embed.FS (optionally narrowed with fs.Sub),
 // an os.DirFS, or any other fs.FS implementation.
+//
+// Files named *.static.yaml load as static bundles: names that are never
+// translated. They are not selectable languages and take part in validation
+// like any other bundle.
 func LoadFromDir(fsys fs.FS) error {
 	entries, err := fs.ReadDir(fsys, ".")
 	if err != nil {
@@ -62,12 +90,16 @@ func LoadFromDir(fsys fs.FS) error {
 		if err != nil {
 			return fmt.Errorf("read locale %s: %w", e.Name(), err)
 		}
-		lang := strings.TrimSuffix(e.Name(), path.Ext(e.Name()))
-		debugf("loading locale %s", lang)
-		if err := loadLanguage(lang, data); err != nil {
+		name := strings.TrimSuffix(e.Name(), path.Ext(e.Name()))
+		if isStaticBundle(name) {
+			debugf("loading static bundle %s", name)
+		} else {
+			debugf("loading locale %s", name)
+			loaded++
+		}
+		if err := loadLanguage(name, data); err != nil {
 			return fmt.Errorf("load locale %s: %w", e.Name(), err)
 		}
-		loaded++
 	}
 	infof("loaded %d locale(s)", loaded)
 	validateLocales()
@@ -144,15 +176,19 @@ func Lookup(code string, path ...string) (any, bool) {
 }
 
 // LookupString returns the string value at the given dotted path.
-// Falls back to English. The bool indicates whether a non-empty string was found.
+// Lookup order: the requested language, English, then static bundles.
+// The bool indicates whether a non-empty string was found; a missing key
+// is logged as a warning.
 func LookupString(code string, path ...string) (string, bool) {
-	for _, lang := range []string{code, "en"} {
+	langs := append([]string{code, "en"}, staticBundleNames()...)
+	for _, lang := range langs {
 		if v, ok := Lookup(lang, path...); ok {
 			if s, ok := v.(string); ok && s != "" {
 				return s, true
 			}
 		}
 	}
+	warnf("missing value for path %v", path)
 	return "", false
 }
 
@@ -171,7 +207,8 @@ func LeafPaths(code string) []string {
 }
 
 // T returns the localized string for the given path segments.
-// Falls back to English and finally to the dotted path itself.
+// Lookup order: current language, English, static bundles, and finally
+// the dotted path itself.
 func T(path ...string) string {
 	if msg, ok := lookup(bundles[currentLang], path); ok && msg != "" {
 		return msg
@@ -179,13 +216,19 @@ func T(path ...string) string {
 	if msg, ok := lookup(bundles["en"], path); ok && msg != "" {
 		return msg
 	}
+	for _, name := range staticBundleNames() {
+		if msg, ok := lookup(bundles[name], path); ok && msg != "" {
+			return msg
+		}
+	}
 	warnf("missing value for path %v", path)
 	return joinPath(path)
 }
 
 // SetLanguage sets the active language. Falls back to English for unknown codes.
+// Static bundles are not selectable languages.
 func SetLanguage(code string) {
-	if _, ok := bundles[code]; ok {
+	if _, ok := bundles[code]; ok && !isStaticBundle(code) {
 		currentLang = code
 		infof("language set to %s", code)
 	} else {
@@ -221,10 +264,14 @@ func copyMap(src map[string]any) map[string]any {
 	return dst
 }
 
-// AvailableLanguages returns the list of loaded language codes.
+// AvailableLanguages returns the list of loaded language codes,
+// excluding static bundles.
 func AvailableLanguages() []string {
 	keys := make([]string, 0, len(bundles))
 	for k := range bundles {
+		if isStaticBundle(k) {
+			continue
+		}
 		keys = append(keys, k)
 	}
 	slices.Sort(keys)
@@ -265,34 +312,84 @@ func LanguageName(code string) string {
 	return code
 }
 
-// validateLocales compares all loaded locale bundles and warns about missing
-// keys and about identical translations shared by several languages (a sign
-// of an untranslated key). It is called automatically after LoadFromDir
-// finishes.
+// validateLocales compares all loaded bundles and warns about:
+//   - keys missing in some languages;
+//   - identical translations shared by several languages (a sign of an
+//     untranslated key);
+//   - duplicate values shared by several keys within one bundle (a sign of
+//     copy-pasted entries that may deserve a shared key) — every bundle,
+//     dynamic or static, is analyzed as its own scope;
+//   - collisions: a key defined in more than one bundle when at least one
+//     of them is static. A key across dynamic languages is a normal
+//     translation; a static key must live in exactly one bundle.
+//
+// It is called automatically after LoadFromDir finishes.
 func validateLocales() {
 	if len(bundles) == 0 {
 		return
 	}
 
-	// paths maps a dotted key to per-language values ("" for non-string or
-	// empty leaves; presence is tracked regardless).
-	paths := make(map[string]map[string]string)
-	for lang, tree := range bundles {
+	// leaves maps a bundle name to its dotted leaf paths and values
+	// ("" for non-string or empty leaves; presence is tracked regardless).
+	leaves := make(map[string]map[string]string)
+	for name, tree := range bundles {
+		vals := make(map[string]string)
 		collectKeys(tree, nil, func(path []string) {
-			dotted := joinPath(path)
-			if paths[dotted] == nil {
-				paths[dotted] = make(map[string]string)
-			}
 			v, _ := lookup(tree, path)
-			paths[dotted][lang] = v
+			vals[joinPath(path)] = v
 		})
+		leaves[name] = vals
 	}
 
-	langs := make([]string, 0, len(bundles))
-	for lang := range bundles {
-		langs = append(langs, lang)
+	langs := AvailableLanguages()
+	statics := staticBundleNames()
+
+	// Collisions: a key present in a static bundle must not exist in any
+	// other bundle, static or dynamic.
+	keyBundles := make(map[string][]string)
+	for _, name := range append(slices.Clone(langs), statics...) {
+		for key := range leaves[name] {
+			keyBundles[key] = append(keyBundles[key], name)
+		}
 	}
-	slices.Sort(langs)
+	dottedAll := make([]string, 0, len(keyBundles))
+	for k := range keyBundles {
+		dottedAll = append(dottedAll, k)
+	}
+	slices.Sort(dottedAll)
+	for _, key := range dottedAll {
+		names := keyBundles[key]
+		hasStatic := false
+		for _, name := range names {
+			if isStaticBundle(name) {
+				hasStatic = true
+				break
+			}
+		}
+		if hasStatic && len(names) > 1 {
+			warnf("key %q defined in multiple bundles: %s", key, strings.Join(names, ", "))
+		}
+	}
+
+	// staticKeys collects all keys declared in static bundles — they are
+	// exempt from the identical-translation check.
+	staticKeys := make(map[string]struct{})
+	for _, name := range statics {
+		for key := range leaves[name] {
+			staticKeys[key] = struct{}{}
+		}
+	}
+
+	// paths maps a dotted key to per-language values (dynamic languages only).
+	paths := make(map[string]map[string]string)
+	for _, lang := range langs {
+		for key, v := range leaves[lang] {
+			if paths[key] == nil {
+				paths[key] = make(map[string]string)
+			}
+			paths[key][lang] = v
+		}
+	}
 
 	dotted := make([]string, 0, len(paths))
 	for k := range paths {
@@ -302,14 +399,18 @@ func validateLocales() {
 
 	for _, key := range dotted {
 		present := paths[key]
-		if len(present) != len(bundles) {
-			missing := make([]string, 0, len(bundles))
+		if len(present) != len(langs) {
+			missing := make([]string, 0, len(langs))
 			for _, lang := range langs {
 				if _, ok := present[lang]; !ok {
 					missing = append(missing, lang)
 				}
 			}
 			warnf("locale key %q missing in: %s", key, strings.Join(missing, ", "))
+		}
+
+		if _, ok := staticKeys[key]; ok {
+			continue
 		}
 
 		// Group languages sharing the same non-empty translation.
@@ -335,20 +436,19 @@ func validateLocales() {
 		}
 	}
 
-	// Duplicate values across different keys within one language point to
-	// copy-pasted locale entries that may deserve a shared key (e.g.
-	// startup.mode_* vs settings.startup.mode_*). The same duplicate usually
-	// exists in every language, so identical key sets are reported once with
-	// the language list.
+	// Duplicate values across different keys within one bundle point to
+	// copy-pasted entries that may deserve a shared key (e.g.
+	// startup.mode_* vs settings.startup.mode_*). Every bundle is its own
+	// scope; the same duplicate usually exists in every language, so
+	// identical key sets are reported once with the bundle list.
 	type dupKey struct {
 		value string
 		keys  string
 	}
 	dups := make(map[dupKey][]string)
-	for _, lang := range langs {
+	for _, name := range append(slices.Clone(langs), statics...) {
 		byValue := make(map[string][]string)
-		for key, values := range paths {
-			v := values[lang]
+		for key, v := range leaves[name] {
 			if !hasLetters(v) {
 				continue
 			}
@@ -360,7 +460,7 @@ func validateLocales() {
 			}
 			slices.Sort(keys)
 			dk := dupKey{value: v, keys: strings.Join(keys, ", ")}
-			dups[dk] = append(dups[dk], lang)
+			dups[dk] = append(dups[dk], name)
 		}
 	}
 	dupKeys := make([]dupKey, 0, len(dups))
@@ -371,10 +471,10 @@ func validateLocales() {
 		return strings.Compare(a.keys, b.keys)
 	})
 	for _, dk := range dupKeys {
-		langsWithDup := dups[dk]
-		slices.Sort(langsWithDup)
+		namesWithDup := dups[dk]
+		slices.Sort(namesWithDup)
 		warnf("locale value %q duplicated in keys [%s] in: %s",
-			truncateRunes(dk.value, 40), dk.keys, strings.Join(langsWithDup, ", "))
+			truncateRunes(dk.value, 40), dk.keys, strings.Join(namesWithDup, ", "))
 	}
 }
 
