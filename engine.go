@@ -14,6 +14,7 @@ import (
 	"path"
 	"slices"
 	"strings"
+	"unicode"
 
 	"github.com/he11ah0und/logger"
 	"github.com/he11ah0und/yamltree"
@@ -265,20 +266,25 @@ func LanguageName(code string) string {
 }
 
 // validateLocales compares all loaded locale bundles and warns about missing
-// keys. It is called automatically after LoadFromDir finishes.
+// keys and about identical translations shared by several languages (a sign
+// of an untranslated key). It is called automatically after LoadFromDir
+// finishes.
 func validateLocales() {
 	if len(bundles) == 0 {
 		return
 	}
 
-	paths := make(map[string]map[string]struct{})
+	// paths maps a dotted key to per-language values ("" for non-string or
+	// empty leaves; presence is tracked regardless).
+	paths := make(map[string]map[string]string)
 	for lang, tree := range bundles {
 		collectKeys(tree, nil, func(path []string) {
 			dotted := joinPath(path)
 			if paths[dotted] == nil {
-				paths[dotted] = make(map[string]struct{})
+				paths[dotted] = make(map[string]string)
 			}
-			paths[dotted][lang] = struct{}{}
+			v, _ := lookup(tree, path)
+			paths[dotted][lang] = v
 		})
 	}
 
@@ -296,17 +302,106 @@ func validateLocales() {
 
 	for _, key := range dotted {
 		present := paths[key]
-		if len(present) == len(bundles) {
-			continue
+		if len(present) != len(bundles) {
+			missing := make([]string, 0, len(bundles))
+			for _, lang := range langs {
+				if _, ok := present[lang]; !ok {
+					missing = append(missing, lang)
+				}
+			}
+			warnf("locale key %q missing in: %s", key, strings.Join(missing, ", "))
 		}
-		missing := make([]string, 0, len(bundles))
-		for _, lang := range langs {
-			if _, ok := present[lang]; !ok {
-				missing = append(missing, lang)
+
+		// Group languages sharing the same non-empty translation.
+		byValue := make(map[string][]string)
+		for lang, v := range present {
+			if v == "" {
+				continue
+			}
+			byValue[v] = append(byValue[v], lang)
+		}
+		groups := make([][]string, 0, len(byValue))
+		for _, group := range byValue {
+			if len(group) > 1 {
+				slices.Sort(group)
+				groups = append(groups, group)
 			}
 		}
-		warnf("locale key %q missing in: %s", key, strings.Join(missing, ", "))
+		slices.SortFunc(groups, func(a, b []string) int {
+			return strings.Compare(a[0], b[0])
+		})
+		for _, group := range groups {
+			warnf("locale key %q has identical translation in: %s", key, strings.Join(group, ", "))
+		}
 	}
+
+	// Duplicate values across different keys within one language point to
+	// copy-pasted locale entries that may deserve a shared key (e.g.
+	// startup.mode_* vs settings.startup.mode_*). The same duplicate usually
+	// exists in every language, so identical key sets are reported once with
+	// the language list.
+	type dupKey struct {
+		value string
+		keys  string
+	}
+	dups := make(map[dupKey][]string)
+	for _, lang := range langs {
+		byValue := make(map[string][]string)
+		for key, values := range paths {
+			v := values[lang]
+			if !hasLetters(v) {
+				continue
+			}
+			byValue[v] = append(byValue[v], key)
+		}
+		for v, keys := range byValue {
+			if len(keys) < 2 {
+				continue
+			}
+			slices.Sort(keys)
+			dk := dupKey{value: v, keys: strings.Join(keys, ", ")}
+			dups[dk] = append(dups[dk], lang)
+		}
+	}
+	dupKeys := make([]dupKey, 0, len(dups))
+	for dk := range dups {
+		dupKeys = append(dupKeys, dk)
+	}
+	slices.SortFunc(dupKeys, func(a, b dupKey) int {
+		return strings.Compare(a.keys, b.keys)
+	})
+	for _, dk := range dupKeys {
+		langsWithDup := dups[dk]
+		slices.Sort(langsWithDup)
+		warnf("locale value %q duplicated in keys [%s] in: %s",
+			truncateRunes(dk.value, 40), dk.keys, strings.Join(langsWithDup, ", "))
+	}
+}
+
+// hasLetters reports whether s contains at least two letter runes — shorter
+// or purely symbolic values ("—", "✓", "%s") are not worth duplicate
+// warnings.
+func hasLetters(s string) bool {
+	n := 0
+	for _, r := range s {
+		if unicode.IsLetter(r) {
+			n++
+			if n >= 2 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// truncateRunes shortens s to at most n runes, appending an ellipsis when
+// truncated.
+func truncateRunes(s string, n int) string {
+	runes := []rune(s)
+	if len(runes) <= n {
+		return s
+	}
+	return string(runes[:n]) + "…"
 }
 
 // collectKeys walks a locale tree and calls yield for every leaf path.
