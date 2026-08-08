@@ -15,6 +15,18 @@ import (
 func resetBundles() {
 	bundles = make(map[string]map[string]any)
 	currentLang = "en"
+	staticNames = nil
+	missingWarned = make(map[string]struct{})
+}
+
+// withTestLogger routes engine output into an in-memory logger terminal and
+// restores the nil logger on cleanup.
+func withTestLogger(t *testing.T) *logger.LogTerminal {
+	t.Helper()
+	l := logger.NewLogger(100)
+	SetLogger(l.Root)
+	t.Cleanup(func() { SetLogger(nil) })
+	return l.Root
 }
 
 func TestLoadFromDir(t *testing.T) {
@@ -179,9 +191,7 @@ func TestValidateIdenticalTranslations(t *testing.T) {
 		"zh.yaml": &fstest.MapFile{Data: []byte("same: 相同文本\npart: Shared\nuniq: 中文\n")},
 	}
 
-	l := logger.NewLogger(100)
-	SetLogger(l.Root)
-	defer SetLogger(nil)
+	term := withTestLogger(t)
 
 	resetBundles()
 	if err := LoadFromDir(fsys); err != nil {
@@ -189,7 +199,7 @@ func TestValidateIdenticalTranslations(t *testing.T) {
 	}
 
 	var warns []string
-	for _, line := range l.Root.GetLines() {
+	for _, line := range term.GetLines() {
 		if strings.Contains(line, "identical translation") {
 			warns = append(warns, line)
 		}
@@ -215,9 +225,7 @@ func TestValidateDuplicateValues(t *testing.T) {
 		"ru.yaml": &fstest.MapFile{Data: []byte("startup:\n  mode_tcp: tcp\nsettings:\n  startup:\n    mode_tcp: tcp\nother: Другой текст\n")},
 	}
 
-	l := logger.NewLogger(100)
-	SetLogger(l.Root)
-	defer SetLogger(nil)
+	term := withTestLogger(t)
 
 	resetBundles()
 	if err := LoadFromDir(fsys); err != nil {
@@ -225,7 +233,7 @@ func TestValidateDuplicateValues(t *testing.T) {
 	}
 
 	var dups []string
-	for _, line := range l.Root.GetLines() {
+	for _, line := range term.GetLines() {
 		if strings.Contains(line, "duplicated in keys") {
 			dups = append(dups, line)
 		}
@@ -247,9 +255,7 @@ func TestStaticBundle(t *testing.T) {
 		"ru.yaml":         &fstest.MapFile{Data: []byte("tab:\n  main: Главная\napp:\n  title: Example App\n")},
 	}
 
-	l := logger.NewLogger(100)
-	SetLogger(l.Root)
-	defer SetLogger(nil)
+	term := withTestLogger(t)
 
 	resetBundles()
 	if err := LoadFromDir(fsys); err != nil {
@@ -276,7 +282,7 @@ func TestStaticBundle(t *testing.T) {
 	// Validation: no identical-translation warning for static keys, but the
 	// copy in ru.yaml collides with the static bundle.
 	var identical, collisions []string
-	for _, line := range l.Root.GetLines() {
+	for _, line := range term.GetLines() {
 		if strings.Contains(line, "identical translation") {
 			identical = append(identical, line)
 		}
@@ -300,9 +306,7 @@ func TestStaticCollisionTranslated(t *testing.T) {
 		"ru.yaml":         &fstest.MapFile{Data: []byte("app:\n  title: Пример\n")},
 	}
 
-	l := logger.NewLogger(100)
-	SetLogger(l.Root)
-	defer SetLogger(nil)
+	term := withTestLogger(t)
 
 	resetBundles()
 	if err := LoadFromDir(fsys); err != nil {
@@ -312,7 +316,7 @@ func TestStaticCollisionTranslated(t *testing.T) {
 	// A translated static key is a collision — warned regardless of who
 	// overrides whom.
 	var collisions []string
-	for _, line := range l.Root.GetLines() {
+	for _, line := range term.GetLines() {
 		if strings.Contains(line, "defined in multiple bundles") {
 			collisions = append(collisions, line)
 		}
@@ -334,9 +338,7 @@ func TestStaticDuplicateDetection(t *testing.T) {
 		"en.yaml":         &fstest.MapFile{Data: []byte("tab:\n  main: Main\n")},
 	}
 
-	l := logger.NewLogger(100)
-	SetLogger(l.Root)
-	defer SetLogger(nil)
+	term := withTestLogger(t)
 
 	resetBundles()
 	if err := LoadFromDir(fsys); err != nil {
@@ -344,7 +346,7 @@ func TestStaticDuplicateDetection(t *testing.T) {
 	}
 
 	var dups []string
-	for _, line := range l.Root.GetLines() {
+	for _, line := range term.GetLines() {
 		if strings.Contains(line, "duplicated in keys") {
 			dups = append(dups, line)
 		}

@@ -14,6 +14,7 @@ import (
 	"path"
 	"slices"
 	"strings"
+	"sync"
 	"unicode"
 
 	"github.com/he11ah0und/logger"
@@ -24,6 +25,16 @@ var (
 	bundles     = make(map[string]map[string]any)
 	currentLang = "en"
 	log         *logger.LogTerminal
+
+	// staticNames caches the sorted names of loaded static bundles so that
+	// lookups do not rescan and resort the bundle map on every call. It is
+	// rebuilt by LoadFromDir after all files are parsed.
+	staticNames []string
+
+	// missingWarned deduplicates "missing value" warnings: a path that
+	// resolves nowhere is reported once per process, not on every lookup.
+	missingWarned   = make(map[string]struct{})
+	missingWarnedMu sync.Mutex
 )
 
 // staticSuffix marks static bundles: any file named *.static.yaml holds names
@@ -39,15 +50,20 @@ func isStaticBundle(name string) bool {
 }
 
 // staticBundleNames returns the sorted names of all loaded static bundles.
+// The list is cached; see staticNames.
 func staticBundleNames() []string {
-	names := make([]string, 0, len(bundles))
+	return staticNames
+}
+
+// rebuildStaticNames refreshes the staticNames cache from bundles.
+func rebuildStaticNames() {
+	staticNames = staticNames[:0]
 	for name := range bundles {
 		if isStaticBundle(name) {
-			names = append(names, name)
+			staticNames = append(staticNames, name)
 		}
 	}
-	slices.Sort(names)
-	return names
+	slices.Sort(staticNames)
 }
 
 // SetLogger sets the logger terminal used by the engine. It is optional:
@@ -67,6 +83,20 @@ func infof(format string, args ...any) {
 
 func warnf(format string, args ...any) {
 	log.Warnf(append([]any{format}, args...)...)
+}
+
+// warnMissingOnce logs a missing-value warning for the path, once per
+// process. The backend reports unresolvable keys at request time; callers
+// must not add their own "key not found" warnings on top.
+func warnMissingOnce(path []string) {
+	missingWarnedMu.Lock()
+	defer missingWarnedMu.Unlock()
+	key := joinPath(path)
+	if _, ok := missingWarned[key]; ok {
+		return
+	}
+	missingWarned[key] = struct{}{}
+	warnf("missing value for path %v", path)
 }
 
 // LoadFromDir reads all *.yaml files from the root of fsys and parses them
@@ -102,6 +132,7 @@ func LoadFromDir(fsys fs.FS) error {
 		}
 	}
 	infof("loaded %d locale(s)", loaded)
+	rebuildStaticNames()
 	validateLocales()
 	return nil
 }
@@ -120,26 +151,37 @@ func loadLanguage(lang string, data []byte) error {
 	return nil
 }
 
-// lookup walks the nested map for the requested path.
-func lookup(tree map[string]any, path []string) (string, bool) {
+// walkTree walks the nested map for the requested path and returns the value
+// found there.
+func walkTree(tree map[string]any, path []string) (any, bool) {
 	if len(path) == 0 {
-		return "", false
+		return nil, false
 	}
 	current, ok := tree[path[0]]
 	if !ok {
-		return "", false
+		return nil, false
 	}
 	for _, p := range path[1:] {
 		sub, ok := current.(map[string]any)
 		if !ok {
-			return "", false
+			return nil, false
 		}
 		current, ok = sub[p]
 		if !ok {
-			return "", false
+			return nil, false
 		}
 	}
-	s, ok := current.(string)
+	return current, true
+}
+
+// lookup walks the nested map for the requested path and returns the string
+// value found there.
+func lookup(tree map[string]any, path []string) (string, bool) {
+	v, ok := walkTree(tree, path)
+	if !ok {
+		return "", false
+	}
+	s, ok := v.(string)
 	return s, ok
 }
 
@@ -158,21 +200,7 @@ func Lookup(code string, path ...string) (any, bool) {
 	if len(path) == 0 {
 		return b, true
 	}
-	current, ok := b[path[0]]
-	if !ok {
-		return nil, false
-	}
-	for _, p := range path[1:] {
-		sub, ok := current.(map[string]any)
-		if !ok {
-			return nil, false
-		}
-		current, ok = sub[p]
-		if !ok {
-			return nil, false
-		}
-	}
-	return current, true
+	return walkTree(b, path)
 }
 
 // LookupString returns the string value at the given dotted path.
@@ -180,7 +208,11 @@ func Lookup(code string, path ...string) (any, bool) {
 // The bool indicates whether a non-empty string was found; a missing key
 // is logged as a warning.
 func LookupString(code string, path ...string) (string, bool) {
-	langs := append([]string{code, "en"}, staticBundleNames()...)
+	langs := []string{code}
+	if code != "en" {
+		langs = append(langs, "en")
+	}
+	langs = append(langs, staticBundleNames()...)
 	for _, lang := range langs {
 		if v, ok := Lookup(lang, path...); ok {
 			if s, ok := v.(string); ok && s != "" {
@@ -188,7 +220,7 @@ func LookupString(code string, path ...string) (string, bool) {
 			}
 		}
 	}
-	warnf("missing value for path %v", path)
+	warnMissingOnce(path)
 	return "", false
 }
 
@@ -200,8 +232,8 @@ func LeafPaths(code string) []string {
 		return nil
 	}
 	var out []string
-	collectKeys(b, nil, func(path []string) {
-		out = append(out, joinPath(path))
+	collectKeys(b, nil, func(p []string, _ any) {
+		out = append(out, joinPath(p))
 	})
 	return out
 }
@@ -210,18 +242,9 @@ func LeafPaths(code string) []string {
 // Lookup order: current language, English, static bundles, and finally
 // the dotted path itself.
 func T(path ...string) string {
-	if msg, ok := lookup(bundles[currentLang], path); ok && msg != "" {
+	if msg, ok := LookupString(currentLang, path...); ok {
 		return msg
 	}
-	if msg, ok := lookup(bundles["en"], path); ok && msg != "" {
-		return msg
-	}
-	for _, name := range staticBundleNames() {
-		if msg, ok := lookup(bundles[name], path); ok && msg != "" {
-			return msg
-		}
-	}
-	warnf("missing value for path %v", path)
 	return joinPath(path)
 }
 
@@ -323,7 +346,8 @@ func LanguageName(code string) string {
 //     of them is static. A key across dynamic languages is a normal
 //     translation; a static key must live in exactly one bundle.
 //
-// It is called automatically after LoadFromDir finishes.
+// Each check lives in its own warn* function below. validateLocales is
+// called automatically after LoadFromDir finishes.
 func validateLocales() {
 	if len(bundles) == 0 {
 		return
@@ -334,53 +358,26 @@ func validateLocales() {
 	leaves := make(map[string]map[string]string)
 	for name, tree := range bundles {
 		vals := make(map[string]string)
-		collectKeys(tree, nil, func(path []string) {
-			v, _ := lookup(tree, path)
-			vals[joinPath(path)] = v
+		collectKeys(tree, nil, func(path []string, v any) {
+			s, _ := v.(string)
+			vals[joinPath(path)] = s
 		})
 		leaves[name] = vals
 	}
 
 	langs := AvailableLanguages()
 	statics := staticBundleNames()
+	paths := languagePaths(leaves, langs)
 
-	// Collisions: a key present in a static bundle must not exist in any
-	// other bundle, static or dynamic.
-	keyBundles := make(map[string][]string)
-	for _, name := range append(slices.Clone(langs), statics...) {
-		for key := range leaves[name] {
-			keyBundles[key] = append(keyBundles[key], name)
-		}
-	}
-	dottedAll := make([]string, 0, len(keyBundles))
-	for k := range keyBundles {
-		dottedAll = append(dottedAll, k)
-	}
-	slices.Sort(dottedAll)
-	for _, key := range dottedAll {
-		names := keyBundles[key]
-		hasStatic := false
-		for _, name := range names {
-			if isStaticBundle(name) {
-				hasStatic = true
-				break
-			}
-		}
-		if hasStatic && len(names) > 1 {
-			warnf("key %q defined in multiple bundles: %s", key, strings.Join(names, ", "))
-		}
-	}
+	warnStaticCollisions(leaves, langs, statics)
+	warnMissingKeys(paths, langs)
+	warnIdenticalTranslations(paths, staticKeySet(leaves, statics))
+	warnDuplicateValues(leaves, langs, statics)
+}
 
-	// staticKeys collects all keys declared in static bundles — they are
-	// exempt from the identical-translation check.
-	staticKeys := make(map[string]struct{})
-	for _, name := range statics {
-		for key := range leaves[name] {
-			staticKeys[key] = struct{}{}
-		}
-	}
-
-	// paths maps a dotted key to per-language values (dynamic languages only).
+// languagePaths maps each dotted key found in dynamic languages to its
+// per-language values.
+func languagePaths(leaves map[string]map[string]string, langs []string) map[string]map[string]string {
 	paths := make(map[string]map[string]string)
 	for _, lang := range langs {
 		for key, v := range leaves[lang] {
@@ -390,32 +387,77 @@ func validateLocales() {
 			paths[key][lang] = v
 		}
 	}
+	return paths
+}
 
-	dotted := make([]string, 0, len(paths))
-	for k := range paths {
-		dotted = append(dotted, k)
-	}
-	slices.Sort(dotted)
-
-	for _, key := range dotted {
-		present := paths[key]
-		if len(present) != len(langs) {
-			missing := make([]string, 0, len(langs))
-			for _, lang := range langs {
-				if _, ok := present[lang]; !ok {
-					missing = append(missing, lang)
-				}
-			}
-			warnf("locale key %q missing in: %s", key, strings.Join(missing, ", "))
+// staticKeySet collects all keys declared in static bundles — they are
+// exempt from the identical-translation check.
+func staticKeySet(leaves map[string]map[string]string, statics []string) map[string]struct{} {
+	keys := make(map[string]struct{})
+	for _, name := range statics {
+		for key := range leaves[name] {
+			keys[key] = struct{}{}
 		}
+	}
+	return keys
+}
 
+// sortedKeys returns the sorted keys of a string-keyed map.
+func sortedKeys[V any](m map[string]V) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+	return keys
+}
+
+// warnStaticCollisions reports keys defined in more than one bundle when at
+// least one of them is static. A static key must live in exactly one bundle.
+func warnStaticCollisions(leaves map[string]map[string]string, langs, statics []string) {
+	keyBundles := make(map[string][]string)
+	for _, name := range append(slices.Clone(langs), statics...) {
+		for key := range leaves[name] {
+			keyBundles[key] = append(keyBundles[key], name)
+		}
+	}
+	for _, key := range sortedKeys(keyBundles) {
+		names := keyBundles[key]
+		if len(names) > 1 && slices.ContainsFunc(names, isStaticBundle) {
+			warnf("key %q defined in multiple bundles: %s", key, strings.Join(names, ", "))
+		}
+	}
+}
+
+// warnMissingKeys reports dynamic-language keys that are absent in some
+// languages.
+func warnMissingKeys(paths map[string]map[string]string, langs []string) {
+	for _, key := range sortedKeys(paths) {
+		present := paths[key]
+		if len(present) == len(langs) {
+			continue
+		}
+		missing := make([]string, 0, len(langs))
+		for _, lang := range langs {
+			if _, ok := present[lang]; !ok {
+				missing = append(missing, lang)
+			}
+		}
+		warnf("locale key %q missing in: %s", key, strings.Join(missing, ", "))
+	}
+}
+
+// warnIdenticalTranslations reports dynamic-language keys that share the same
+// non-empty translation across several languages — a sign of an untranslated
+// key. Keys declared in static bundles are exempt.
+func warnIdenticalTranslations(paths map[string]map[string]string, staticKeys map[string]struct{}) {
+	for _, key := range sortedKeys(paths) {
 		if _, ok := staticKeys[key]; ok {
 			continue
 		}
-
 		// Group languages sharing the same non-empty translation.
 		byValue := make(map[string][]string)
-		for lang, v := range present {
+		for lang, v := range paths[key] {
 			if v == "" {
 				continue
 			}
@@ -435,12 +477,14 @@ func validateLocales() {
 			warnf("locale key %q has identical translation in: %s", key, strings.Join(group, ", "))
 		}
 	}
+}
 
-	// Duplicate values across different keys within one bundle point to
-	// copy-pasted entries that may deserve a shared key (e.g.
-	// startup.mode_* vs settings.startup.mode_*). Every bundle is its own
-	// scope; the same duplicate usually exists in every language, so
-	// identical key sets are reported once with the bundle list.
+// warnDuplicateValues reports duplicate values shared by several keys within
+// one bundle — a sign of copy-pasted entries that may deserve a shared key
+// (e.g. startup.mode_* vs settings.startup.mode_*). Every bundle, dynamic or
+// static, is its own scope; the same duplicate usually exists in every
+// language, so identical key sets are reported once with the bundle list.
+func warnDuplicateValues(leaves map[string]map[string]string, langs, statics []string) {
 	type dupKey struct {
 		value string
 		keys  string
@@ -504,14 +548,15 @@ func truncateRunes(s string, n int) string {
 	return string(runes[:n]) + "…"
 }
 
-// collectKeys walks a locale tree and calls yield for every leaf path.
-func collectKeys(tree map[string]any, path []string, yield func([]string)) {
+// collectKeys walks a locale tree and calls yield for every leaf path with
+// the leaf value.
+func collectKeys(tree map[string]any, path []string, yield func([]string, any)) {
 	for k, v := range tree {
 		p := keyPath(path, k)
 		if sub, ok := v.(map[string]any); ok {
 			collectKeys(sub, p, yield)
 		} else {
-			yield(p)
+			yield(p, v)
 		}
 	}
 }
