@@ -6,7 +6,7 @@ import (
 	"unicode"
 )
 
-// validateLocales compares all loaded bundles and warns about:
+// validateLocales compares all loaded UI bundles and warns about:
 //   - keys missing in some languages;
 //   - identical translations shared by several languages (a sign of an
 //     untranslated key);
@@ -20,14 +20,27 @@ import (
 // Each check lives in its own warn* function below. validateLocales is
 // called automatically after LoadFromDir finishes.
 func validateLocales() {
-	if len(bundles) == 0 {
+	validateBundleSet(bundles)
+}
+
+// validateLogBundles runs the same checks within the logs domain. The logs
+// domain is a separate key space: no cross-domain duplicates or collisions
+// are reported.
+func validateLogBundles() {
+	validateBundleSet(logBundles)
+}
+
+// validateBundleSet runs all locale checks on one bundle set. Static bundles
+// are recognized by name; the logs domain has none.
+func validateBundleSet(bundleSet map[string]map[string]any) {
+	if len(bundleSet) == 0 {
 		return
 	}
 
 	// leaves maps a bundle name to its dotted leaf paths and values
 	// ("" for non-string or empty leaves; presence is tracked regardless).
 	leaves := make(map[string]map[string]string)
-	for name, tree := range bundles {
+	for name, tree := range bundleSet {
 		vals := make(map[string]string)
 		collectKeys(tree, nil, func(path []string, v any) {
 			s, _ := v.(string)
@@ -36,8 +49,16 @@ func validateLocales() {
 		leaves[name] = vals
 	}
 
-	langs := AvailableLanguages()
-	statics := staticBundleNames()
+	var langs, statics []string
+	for name := range bundleSet {
+		if isStaticBundle(name) {
+			statics = append(statics, name)
+		} else {
+			langs = append(langs, name)
+		}
+	}
+	slices.Sort(langs)
+	slices.Sort(statics)
 	paths := languagePaths(leaves, langs)
 
 	warnStaticCollisions(leaves, langs, statics)

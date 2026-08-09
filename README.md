@@ -18,6 +18,17 @@ msg := localengine.T("about", "btn", "open_repo")
   not selectable languages, and are validated like any other bundle.
 - Loads from any `io/fs.FS`: `embed.FS` (optionally narrowed with `fs.Sub`),
   `os.DirFS`, test fixtures via `testing/fstest.MapFS`.
+- Meta header: a locale file may declare its domain and binding at the top
+  level — `meta: {type: ui|logs, binding: internal|external}`. Absent meta
+  defaults to `ui, external` (backward compatible); unknown values are load
+  errors. UI files load via `LoadFromDir`, logs files via `LoadLogsFromDir`;
+  each loader rejects files of the other domain.
+- Logs domain: `LoadLogsFromDir` loads `logs, internal` files into a
+  separate key space (no cross-domain duplicate/collision warnings) and
+  requires an `en` file. `LogResolver()` returns a
+  `func(key string) (format string, ok bool)` for the logger's keyed
+  methods, with the same semantics as UI lookup: active language (`SetLanguage`),
+  English fallback, warn-once on missing keys.
 - Locale parity linter: after loading, warns about keys missing in some
   languages (`locale key "x.y" missing in: ru, zh`), identical translations
   across languages (a sign of an untranslated key), duplicate values shared
@@ -63,6 +74,23 @@ startup:
 
 Locale files must not repeat these keys: any key defined in more than one
 bundle (when at least one is static) is reported as a collision.
+
+Logs locales live in their own directory/FS and declare the logs domain:
+
+```yaml
+meta:
+  type: logs
+  binding: internal
+core:
+  download: downloading %s
+```
+
+```go
+if err := localengine.LoadLogsFromDir(logsSub); err != nil {
+	log.Fatal(err)
+}
+log.Root.SetResolver(logger.Resolver(localengine.LogResolver()))
+```
 
 ## Notes
 

@@ -12,6 +12,7 @@ import (
 
 func resetBundles() {
 	bundles = make(map[string]map[string]any)
+	logBundles = make(map[string]map[string]any)
 	currentLang = "en"
 	staticNames = nil
 	missingWarned = make(map[string]struct{})

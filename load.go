@@ -11,12 +11,15 @@ import (
 )
 
 // LoadFromDir reads all *.yaml files from the root of fsys and parses them
-// as locales. fsys may be an embed.FS (optionally narrowed with fs.Sub),
+// as UI locales. fsys may be an embed.FS (optionally narrowed with fs.Sub),
 // an os.DirFS, or any other fs.FS implementation.
 //
 // Files named *.static.yaml load as static bundles: names that are never
 // translated. They are not selectable languages and take part in validation
 // like any other bundle.
+//
+// A file whose meta header declares type "logs" is rejected here; load it
+// with LoadLogsFromDir instead.
 func LoadFromDir(fsys fs.FS) error {
 	entries, err := fs.ReadDir(fsys, ".")
 	if err != nil {
@@ -27,20 +30,20 @@ func LoadFromDir(fsys fs.FS) error {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".yaml") {
 			continue
 		}
-		data, err := fs.ReadFile(fsys, e.Name())
+		name, tree, meta, err := parseLocaleFile(fsys, e.Name())
 		if err != nil {
-			return fmt.Errorf("read locale %s: %w", e.Name(), err)
+			return err
 		}
-		name := strings.TrimSuffix(e.Name(), path.Ext(e.Name()))
+		if meta.Type == MetaTypeLogs {
+			return fmt.Errorf("load locale %s: declared as logs, use LoadLogsFromDir", e.Name())
+		}
 		if isStaticBundle(name) {
 			debugf("loading static bundle %s", name)
 		} else {
-			debugf("loading locale %s", name)
+			debugf("loading locale %s (%s, %s)", name, meta.Type, meta.Binding)
 			loaded++
 		}
-		if err := loadLanguage(name, data); err != nil {
-			return fmt.Errorf("load locale %s: %w", e.Name(), err)
-		}
+		bundles[name] = tree
 	}
 	infof("loaded %d locale(s)", loaded)
 	rebuildStaticNames()
@@ -53,11 +56,22 @@ func LoadFromOSDir(dir string) error {
 	return LoadFromDir(os.DirFS(dir))
 }
 
-func loadLanguage(lang string, data []byte) error {
-	raw, err := yamltree.LoadTree(data)
+// parseLocaleFile reads and parses one locale file: it loads the YAML tree,
+// strips and validates the meta header, and returns the bundle name (file
+// name without extension), the tree, and the declared meta.
+func parseLocaleFile(fsys fs.FS, fileName string) (string, map[string]any, localeMeta, error) {
+	data, err := fs.ReadFile(fsys, fileName)
 	if err != nil {
-		return err
+		return "", nil, localeMeta{}, fmt.Errorf("read locale %s: %w", fileName, err)
 	}
-	bundles[lang] = raw
-	return nil
+	tree, err := yamltree.LoadTree(data)
+	if err != nil {
+		return "", nil, localeMeta{}, fmt.Errorf("load locale %s: %w", fileName, err)
+	}
+	meta, err := parseMeta(tree)
+	if err != nil {
+		return "", nil, localeMeta{}, fmt.Errorf("load locale %s: %w", fileName, err)
+	}
+	name := strings.TrimSuffix(fileName, path.Ext(fileName))
+	return name, tree, meta, nil
 }
