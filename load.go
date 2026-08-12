@@ -11,6 +11,18 @@ import (
 )
 
 // LoadFromDir reads all *.yaml files from the root of fsys and parses them
+// as UI locales using the default Store.
+func LoadFromDir(fsys fs.FS) error {
+	return defaultStore.LoadFromDir(fsys)
+}
+
+// LoadFromOSDir reads all *.yaml files from dir on the local filesystem
+// using the default Store.
+func LoadFromOSDir(dir string) error {
+	return defaultStore.LoadFromOSDir(dir)
+}
+
+// LoadFromDir reads all *.yaml files from the root of fsys and parses them
 // as UI locales. fsys may be an embed.FS (optionally narrowed with fs.Sub),
 // an os.DirFS, or any other fs.FS implementation.
 //
@@ -20,12 +32,17 @@ import (
 //
 // A file whose meta header declares type "logs" is rejected here; load it
 // with LoadLogsFromDir instead.
-func LoadFromDir(fsys fs.FS) error {
+func (s *Store) LoadFromDir(fsys fs.FS) error {
 	entries, err := fs.ReadDir(fsys, ".")
 	if err != nil {
 		return fmt.Errorf("read locale dir: %w", err)
 	}
-	loaded := 0
+	type parsedFile struct {
+		name string
+		tree map[string]any
+		meta localeMeta
+	}
+	parsed := make([]parsedFile, 0, len(entries))
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".yaml") {
 			continue
@@ -37,23 +54,39 @@ func LoadFromDir(fsys fs.FS) error {
 		if meta.Type == MetaTypeLogs {
 			return fmt.Errorf("load locale %s: declared as logs, use LoadLogsFromDir", e.Name())
 		}
-		if isStaticBundle(name) {
-			debugf("loading static bundle %s", name)
+		parsed = append(parsed, parsedFile{name, tree, meta})
+	}
+
+	loaded := 0
+	for _, p := range parsed {
+		if isStaticBundle(p.name) {
+			s.debugf("loading static bundle %s", p.name)
 		} else {
-			debugf("loading locale %s (%s, %s)", name, meta.Type, meta.Binding)
+			s.debugf("loading locale %s (%s, %s)", p.name, p.meta.Type, p.meta.Binding)
 			loaded++
 		}
-		bundles[name] = tree
 	}
-	infof("loaded %d locale(s)", loaded)
-	rebuildStaticNames()
-	validateLocales()
+
+	s.mu.Lock()
+	if err := s.ensureDefaultsLocked(); err != nil {
+		s.mu.Unlock()
+		return err
+	}
+	for _, p := range parsed {
+		s.bundles[p.name] = p.tree
+	}
+	s.rebuildStaticNames()
+	s.defaultLocaleCache = ""
+	s.mu.Unlock()
+
+	s.infof("loaded %d locale(s)", loaded)
+	s.validateLocales()
 	return nil
 }
 
 // LoadFromOSDir reads all *.yaml files from dir on the local filesystem.
-func LoadFromOSDir(dir string) error {
-	return LoadFromDir(os.DirFS(dir))
+func (s *Store) LoadFromOSDir(dir string) error {
+	return s.LoadFromDir(os.DirFS(dir))
 }
 
 // parseLocaleFile reads and parses one locale file: it loads the YAML tree,

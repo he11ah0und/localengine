@@ -1,0 +1,16 @@
+{
+  "name": "@he11ah0und/localengine-web",
+  "version": "0.1.0",
+  "description": "Svelte localization helpers backed by the localengine Go engine",
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    ".": "./src/locale.svelte.ts",
+    "./backend": "./src/backend.ts",
+    "./adapters/wails": "./src/adapters/wails.ts",
+    "./adapters/http": "./src/adapters/http.ts"
+  },
+  "peerDependencies": {
+    "svelte": "^5.0.0"
+  }
+}

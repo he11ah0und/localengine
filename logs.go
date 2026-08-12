@@ -7,11 +7,23 @@ import (
 	"strings"
 )
 
-// logBundles holds the logs-domain locales: key → format string for log
-// messages, resolved at runtime through LogResolver. Logs bundles are a
-// separate key space from the UI bundles: a key in a ui file and the same
-// key in a logs file are unrelated.
-var logBundles = make(map[string]map[string]any)
+// LoadLogsFromDir reads all *.yaml files from the root of fsys and parses
+// them as logs-domain locales using the default Store.
+func LoadLogsFromDir(fsys fs.FS) error {
+	return defaultStore.LoadLogsFromDir(fsys)
+}
+
+// LoadLogsFromOSDir reads all *.yaml logs locale files from dir on the
+// local filesystem using the default Store.
+func LoadLogsFromOSDir(dir string) error {
+	return defaultStore.LoadLogsFromOSDir(dir)
+}
+
+// LogResolver returns a resolver over the default Store's logs-domain
+// bundles, suitable for logger.LogTerminal.SetResolver.
+func LogResolver() func(key string) (format string, ok bool) {
+	return defaultStore.LogResolver()
+}
 
 // LoadLogsFromDir reads all *.yaml files from the root of fsys and parses
 // them as logs-domain locales. Every file must declare
@@ -23,12 +35,19 @@ var logBundles = make(map[string]map[string]any)
 // Lookup semantics mirror the UI domain (active language, English fallback,
 // warn-once on missing keys); validation (parity, identical translations,
 // duplicate values) runs within the logs domain only.
-func LoadLogsFromDir(fsys fs.FS) error {
+//
+// Logs bundles are a separate key space from the UI bundles: a key in a ui
+// file and the same key in a logs file are unrelated.
+func (s *Store) LoadLogsFromDir(fsys fs.FS) error {
 	entries, err := fs.ReadDir(fsys, ".")
 	if err != nil {
 		return fmt.Errorf("read logs locale dir: %w", err)
 	}
-	loaded := 0
+	type parsedFile struct {
+		name string
+		tree map[string]any
+	}
+	parsed := make([]parsedFile, 0, len(entries))
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".yaml") {
 			continue
@@ -40,22 +59,29 @@ func LoadLogsFromDir(fsys fs.FS) error {
 		if meta.Type != MetaTypeLogs {
 			return fmt.Errorf("load logs locale %s: meta type must be %q", e.Name(), MetaTypeLogs)
 		}
-		debugf("loading logs locale %s (%s, %s)", name, meta.Type, meta.Binding)
-		logBundles[name] = tree
-		loaded++
+		s.debugf("loading logs locale %s (%s, %s)", name, meta.Type, meta.Binding)
+		parsed = append(parsed, parsedFile{name, tree})
 	}
-	if _, ok := logBundles["en"]; !ok {
+
+	s.mu.Lock()
+	for _, p := range parsed {
+		s.logBundles[p.name] = p.tree
+	}
+	_, hasEn := s.logBundles["en"]
+	s.mu.Unlock()
+
+	if !hasEn {
 		return fmt.Errorf("logs locales require an en file")
 	}
-	infof("loaded %d logs locale(s)", loaded)
-	validateLogBundles()
+	s.infof("loaded %d logs locale(s)", len(parsed))
+	s.validateLogBundles()
 	return nil
 }
 
 // LoadLogsFromOSDir reads all *.yaml logs locale files from dir on the local
 // filesystem.
-func LoadLogsFromOSDir(dir string) error {
-	return LoadLogsFromDir(os.DirFS(dir))
+func (s *Store) LoadLogsFromOSDir(dir string) error {
+	return s.LoadLogsFromDir(os.DirFS(dir))
 }
 
 // LogResolver returns a resolver over the logs-domain bundles, suitable for
@@ -64,27 +90,37 @@ func LoadLogsFromOSDir(dir string) error {
 // language — formatting with args stays on the caller. The language follows
 // the same SetLanguage machinery as the UI. A missing key is reported once
 // per process and resolves to not-ok; the logger then prints the key itself.
-func LogResolver() func(key string) (format string, ok bool) {
+func (s *Store) LogResolver() func(key string) (format string, ok bool) {
 	return func(key string) (string, bool) {
-		return lookupLogs(currentLang, strings.Split(key, "."))
+		s.mu.RLock()
+		lang := s.currentLang
+		s.mu.RUnlock()
+		return s.lookupLogs(lang, strings.Split(key, "."))
 	}
 }
 
 // lookupLogs resolves path in the logs domain: the requested language, then
 // English. Static bundles do not take part — log messages are internal.
-func lookupLogs(code string, path []string) (string, bool) {
+func (s *Store) lookupLogs(code string, path []string) (string, bool) {
 	langs := []string{code}
 	if code != "en" {
 		langs = append(langs, "en")
 	}
+	s.mu.RLock()
+	found := ""
 	for _, lang := range langs {
-		if b, ok := logBundles[lang]; ok {
-			if s, ok := lookup(b, path); ok && s != "" {
-				return s, true
+		if b, ok := s.logBundles[lang]; ok {
+			if str, ok := lookup(b, path); ok && str != "" {
+				found = str
+				break
 			}
 		}
 	}
+	s.mu.RUnlock()
+	if found != "" {
+		return found, true
+	}
 	// The "logs" prefix keeps the warn-once key space separate from UI paths.
-	warnMissingOnce(append([]string{"logs"}, path...))
+	s.warnMissingOnce(append([]string{"logs"}, path...))
 	return "", false
 }

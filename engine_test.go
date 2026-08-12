@@ -11,11 +11,16 @@ import (
 )
 
 func resetBundles() {
-	bundles = make(map[string]map[string]any)
-	logBundles = make(map[string]map[string]any)
-	currentLang = "en"
-	staticNames = nil
-	missingWarned = make(map[string]struct{})
+	s := defaultStore
+	s.mu.Lock()
+	s.bundles = make(map[string]map[string]any)
+	s.logBundles = make(map[string]map[string]any)
+	s.currentLang = "en"
+	s.staticNames = nil
+	s.mu.Unlock()
+	s.warnMu.Lock()
+	s.missingWarned = make(map[string]struct{})
+	s.warnMu.Unlock()
 }
 
 // withTestLogger routes engine output into an in-memory logger terminal and
@@ -121,7 +126,7 @@ func TestFallbackToEnglish(t *testing.T) {
 
 func TestMissingKeyReturnsPath(t *testing.T) {
 	resetBundles()
-	bundles["en"] = map[string]any{"existing": map[string]any{"key": "value"}}
+	defaultStore.bundles["en"] = map[string]any{"existing": map[string]any{"key": "value"}}
 
 	if got := T("missing", "key"); got != "missing.key" {
 		t.Errorf("expected dotted path fallback, got %q", got)
@@ -149,9 +154,9 @@ func TestLanguageName(t *testing.T) {
 
 func TestDetectSystemLanguage(t *testing.T) {
 	resetBundles()
-	bundles["en"] = map[string]any{}
-	bundles["ru"] = map[string]any{}
-	bundles["zh"] = map[string]any{}
+	defaultStore.bundles["en"] = map[string]any{}
+	defaultStore.bundles["ru"] = map[string]any{}
+	defaultStore.bundles["zh"] = map[string]any{}
 
 	orig := os.Getenv("LANG")
 	defer os.Setenv("LANG", orig)
