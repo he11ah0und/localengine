@@ -19,6 +19,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing/fstest"
 
 	"github.com/he11ah0und/localengine"
@@ -34,6 +35,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	domain := fs.String("domain", "ui", "locale domain to check: ui or logs")
 	strict := fs.Bool("strict", false, "exit 1 when warnings are found")
 	format := fs.String("format", "text", "output format: text or json")
+	platform := fs.String("platform", runtime.GOOS, "GOOS selecting platform overlay files (linux, windows, darwin)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -54,7 +56,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	var warnings []localengine.Warning
 	failed := false
 	for _, p := range paths {
-		ws, err := checkPath(p, *domain)
+		ws, err := checkPath(p, *domain, *platform)
 		if err != nil {
 			fmt.Fprintf(stderr, "%s: %v\n", p, err)
 			failed = true
@@ -84,8 +86,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 }
 
 // checkPath loads one argument (a locale dir or a single .yaml file) into a
-// fresh store and returns its validation findings.
-func checkPath(p, domain string) ([]localengine.Warning, error) {
+// fresh store and returns its validation findings. goos selects which
+// platform overlay files take part in the load.
+func checkPath(p, domain, goos string) ([]localengine.Warning, error) {
 	info, err := os.Stat(p)
 	if err != nil {
 		return nil, err
@@ -94,9 +97,9 @@ func checkPath(p, domain string) ([]localengine.Warning, error) {
 	store := localengine.New()
 	if info.IsDir() {
 		if domain == "logs" {
-			err = store.LoadLogsFromOSDir(p)
+			err = store.LoadLogsFromDirPlatform(os.DirFS(p), goos)
 		} else {
-			err = store.LoadFromOSDir(p)
+			err = store.LoadFromDirPlatform(os.DirFS(p), goos)
 		}
 	} else {
 		data, err := os.ReadFile(p)
@@ -107,9 +110,9 @@ func checkPath(p, domain string) ([]localengine.Warning, error) {
 			filepath.Base(p): &fstest.MapFile{Data: data},
 		}
 		if domain == "logs" {
-			err = store.LoadLogsFromDir(fsys)
+			err = store.LoadLogsFromDirPlatform(fsys, goos)
 		} else {
-			err = store.LoadFromDir(fsys)
+			err = store.LoadFromDirPlatform(fsys, goos)
 		}
 	}
 	if err != nil {

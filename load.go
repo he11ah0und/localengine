@@ -5,6 +5,7 @@ import (
 	"io/fs"
 	"os"
 	"path"
+	"runtime"
 	"strings"
 
 	"github.com/he11ah0und/yamltree"
@@ -22,6 +23,12 @@ func LoadFromOSDir(dir string) error {
 	return defaultStore.LoadFromOSDir(dir)
 }
 
+// LoadFromDirPlatform is LoadFromDir for an explicit platform instead of
+// runtime.GOOS, using the default Store.
+func LoadFromDirPlatform(fsys fs.FS, goos string) error {
+	return defaultStore.LoadFromDirPlatform(fsys, goos)
+}
+
 // LoadFromDir reads all *.yaml files from the root of fsys and parses them
 // as UI locales. fsys may be an embed.FS (optionally narrowed with fs.Sub),
 // an os.DirFS, or any other fs.FS implementation.
@@ -30,21 +37,33 @@ func LoadFromOSDir(dir string) error {
 // translated. They are not selectable languages and take part in validation
 // like any other bundle.
 //
+// Files named <lang>.<goos>.yaml (e.g. en.linux.yaml) are platform overlays:
+// on a matching runtime.GOOS their keys are deep-merged over the base <lang>
+// bundle; files for other platforms are skipped. Use LoadFromDirPlatform to
+// load for an explicit platform (e.g. validating every platform in tests).
+//
 // A file whose meta header declares type "logs" is rejected here; load it
 // with LoadLogsFromDir instead.
 func (s *Store) LoadFromDir(fsys fs.FS) error {
+	return s.LoadFromDirPlatform(fsys, runtime.GOOS)
+}
+
+// LoadFromDirPlatform is LoadFromDir for an explicit platform instead of
+// runtime.GOOS.
+func (s *Store) LoadFromDirPlatform(fsys fs.FS, goos string) error {
 	entries, err := fs.ReadDir(fsys, ".")
 	if err != nil {
 		return fmt.Errorf("read locale dir: %w", err)
 	}
-	type parsedFile struct {
-		name string
-		tree map[string]any
-		meta localeMeta
-	}
-	parsed := make([]parsedFile, 0, len(entries))
+	parsed := make([]parsedLocaleFile, 0, len(entries))
+	var overlays []parsedLocaleFile
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".yaml") {
+			continue
+		}
+		base, platform, isOverlay := splitPlatformOverlay(e.Name())
+		if isOverlay && platform != goos {
+			s.debugf("skipping platform overlay %s (for %s)", e.Name(), platform)
 			continue
 		}
 		name, tree, meta, err := parseLocaleFile(fsys, e.Name())
@@ -54,8 +73,14 @@ func (s *Store) LoadFromDir(fsys fs.FS) error {
 		if meta.Type == MetaTypeLogs {
 			return fmt.Errorf("load locale %s: declared as logs, use LoadLogsFromDir", e.Name())
 		}
-		parsed = append(parsed, parsedFile{name, tree, meta})
+		if isOverlay {
+			s.debugf("loading platform overlay %s", e.Name())
+			overlays = append(overlays, parsedLocaleFile{base, tree, meta})
+			continue
+		}
+		parsed = append(parsed, parsedLocaleFile{name, tree, meta})
 	}
+	parsed = mergePlatformOverlays(parsed, overlays)
 
 	loaded := 0
 	for _, p := range parsed {

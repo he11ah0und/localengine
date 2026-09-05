@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"runtime"
 	"strings"
 )
 
@@ -17,6 +18,12 @@ func LoadLogsFromDir(fsys fs.FS) error {
 // local filesystem using the default Store.
 func LoadLogsFromOSDir(dir string) error {
 	return defaultStore.LoadLogsFromOSDir(dir)
+}
+
+// LoadLogsFromDirPlatform is LoadLogsFromDir for an explicit platform
+// instead of runtime.GOOS, using the default Store.
+func LoadLogsFromDirPlatform(fsys fs.FS, goos string) error {
+	return defaultStore.LoadLogsFromDirPlatform(fsys, goos)
 }
 
 // LogResolver returns a resolver over the default Store's logs-domain
@@ -38,18 +45,30 @@ func LogResolver() func(key string) (format string, ok bool) {
 //
 // Logs bundles are a separate key space from the UI bundles: a key in a ui
 // file and the same key in a logs file are unrelated.
+//
+// Platform overlays work like in the UI domain: <lang>.<goos>.yaml files
+// merge over the base <lang> logs bundle on a matching platform and are
+// skipped otherwise.
 func (s *Store) LoadLogsFromDir(fsys fs.FS) error {
+	return s.LoadLogsFromDirPlatform(fsys, runtime.GOOS)
+}
+
+// LoadLogsFromDirPlatform is LoadLogsFromDir for an explicit platform
+// instead of runtime.GOOS.
+func (s *Store) LoadLogsFromDirPlatform(fsys fs.FS, goos string) error {
 	entries, err := fs.ReadDir(fsys, ".")
 	if err != nil {
 		return fmt.Errorf("read logs locale dir: %w", err)
 	}
-	type parsedFile struct {
-		name string
-		tree map[string]any
-	}
-	parsed := make([]parsedFile, 0, len(entries))
+	parsed := make([]parsedLocaleFile, 0, len(entries))
+	var overlays []parsedLocaleFile
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".yaml") {
+			continue
+		}
+		base, platform, isOverlay := splitPlatformOverlay(e.Name())
+		if isOverlay && platform != goos {
+			s.debugf("skipping platform overlay %s (for %s)", e.Name(), platform)
 			continue
 		}
 		name, tree, meta, err := parseLocaleFile(fsys, e.Name())
@@ -59,9 +78,15 @@ func (s *Store) LoadLogsFromDir(fsys fs.FS) error {
 		if meta.Type != MetaTypeLogs {
 			return fmt.Errorf("load logs locale %s: meta type must be %q", e.Name(), MetaTypeLogs)
 		}
+		if isOverlay {
+			s.debugf("loading logs platform overlay %s", e.Name())
+			overlays = append(overlays, parsedLocaleFile{base, tree, meta})
+			continue
+		}
 		s.debugf("loading logs locale %s (%s, %s)", name, meta.Type, meta.Binding)
-		parsed = append(parsed, parsedFile{name, tree})
+		parsed = append(parsed, parsedLocaleFile{name, tree, meta})
 	}
+	parsed = mergePlatformOverlays(parsed, overlays)
 
 	s.mu.Lock()
 	for _, p := range parsed {
