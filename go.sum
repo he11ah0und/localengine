@@ -1,6 +1,6 @@
-github.com/he11ah0und/logger v0.1.2 h1:089RpE1kI1Eos9urlKl3lqz+NN7xlnrJtUJLw047FFo=
+github.com/he11ah0und/logger v0.1.2 h1:wTq3NhpshX77Bw4u89ocZeAmj4dc/yqGEqtAtoAYROE=
 github.com/he11ah0und/logger v0.1.2/go.mod h1:e3M24aKj1dHnxw9wzjzrkb/APCSaOIdO0K2EnICk/oc=
-github.com/he11ah0und/yamltree v0.1.2 h1:s4siX6vVVFGQI8GmOXLNyssRuu6cf8z2ZGhj6b4cCXM=
+github.com/he11ah0und/yamltree v0.1.2 h1:fk+WDKMA8/cUd5132mxu12VAz79wdGqqd9yg0qLnF0g=
 github.com/he11ah0und/yamltree v0.1.2/go.mod h1:WpQvyd3evJqxF4W4Qax3hhKPKTN9bIxy3mXsh1Jypnk=
 gopkg.in/check.v1 v0.0.0-20161208181325-20d25e280405 h1:yhCVgyC4o1eVCa2tZl7eS0r+SDo693bJlVdllGtEeKM=
 gopkg.in/check.v1 v0.0.0-20161208181325-20d25e280405/go.mod h1:Co6ibVJAznAaIkqp8huTwlJQCZ016jof/cbN4VW5Yz0=
